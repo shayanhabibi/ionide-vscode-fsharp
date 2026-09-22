@@ -222,6 +222,10 @@ type TestItem with
 
     member this.TestFramework: string = this?testFramework
 
+    /// Addresses this test to Microsoft.Testing.Platform. A grouping node and a test run under
+    /// VSTest carry `None`.
+    member this.PlatformUid: string option = this?platformUid |> Option.ofObj
+
 [<RequireQualifiedAccess; StringEnum(CaseRules.None)>]
 type TestResultOutcome =
     | NotExecuted
@@ -800,13 +804,18 @@ module TestItem =
         recurse root
 
     type TestItemBuilder =
-        { id: TestId
-          label: string
-          uri: Uri option
-          range: Vscode.Range option
-          children: TestItem array
-          // i.e. NUnit. Used for an Nunit-specific workaround
-          testFramework: TestFrameworkId option }
+        {
+            id: TestId
+            label: string
+            uri: Uri option
+            range: Vscode.Range option
+            children: TestItem array
+            // i.e. NUnit. Used for an Nunit-specific workaround
+            testFramework: TestFrameworkId option
+            /// Addresses the test to Microsoft.Testing.Platform, which names a test to run by uid
+            /// rather than by a filter expression.
+            platformUid: string option
+        }
 
     type TestItemFactory = TestItemBuilder -> TestItem
 
@@ -822,6 +831,10 @@ module TestItem =
 
             match builder.testFramework with
             | Some frameworkId -> testItem?testFramework <- frameworkId
+            | None -> ()
+
+            match builder.platformUid with
+            | Some uid -> testItem?platformUid <- uid
             | None -> ()
 
             testItem
@@ -845,7 +858,8 @@ module TestItem =
                   uri = location |> LocationRecord.tryGetUri
                   range = location |> LocationRecord.tryGetRange
                   children = namedNode.Children |> Array.map recurse
-                  testFramework = None }
+                  testFramework = None
+                  platformUid = None }
 
         recurse hierarchy
 
@@ -881,7 +895,8 @@ module TestItem =
                       uri = Some uri
                       range = range
                       children = t.childs |> Array.map (fun n -> recurse fullName (Some t.moduleType) n)
-                      testFramework = t?``type`` }
+                      testFramework = t?``type``
+                      platformUid = None }
 
             ti
 
@@ -899,7 +914,8 @@ module TestItem =
               uri = None
               range = None
               children = children
-              testFramework = None }
+              testFramework = None
+              platformUid = None }
 
 
     let ofTestDTOs testItemFactory tryGetLocation (flatTests: TestItemDTO array) =
@@ -950,14 +966,14 @@ module TestItem =
                       children = namedNode.Children |> Array.map recurse
                       testFramework =
                         namedNode.Data
-                        |> Option.bind (fun t -> t.ExecutorUri |> TestFrameworkId.tryFromExecutorUri) }
+                        |> Option.bind (fun t -> t.ExecutorUri |> TestFrameworkId.tryFromExecutorUri)
+                      platformUid = namedNode.Data |> Option.bind (fun dto -> dto.PlatformUid) }
 
             recurse hierarchy
 
         /// The tree the server reported, linked through `ParentId`.
         let hierarchyOfDtos (flatTests: TestItemDTO array) : TestName.NameHierarchy<TestItemDTO> array =
-            let byParent =
-                flatTests |> Array.groupBy (fun dto -> dto.ParentId) |> Map.ofArray
+            let byParent = flatTests |> Array.groupBy (fun dto -> dto.ParentId) |> Map.ofArray
 
             let childrenOf parentId =
                 byParent |> Map.tryFind parentId |> Option.defaultValue [||]
@@ -1072,7 +1088,8 @@ module TestItem =
                           uri = maybeLocation |> LocationRecord.tryGetUri
                           range = maybeLocation |> LocationRecord.tryGetRange
                           children = [||]
-                          testFramework = None }
+                          testFramework = None
+                          platformUid = None }
 
             collection.add (testItem)
 
@@ -1147,7 +1164,8 @@ module TestDiscovery =
                       uri = withUri.uri
                       range = withUri.range
                       children = target.children.TestItems()
-                      testFramework = withUri?testFramework }
+                      testFramework = withUri?testFramework
+                      platformUid = target.PlatformUid }
 
             (replacementItem, withUri)
 
@@ -1299,7 +1317,8 @@ module TestDiscovery =
             let testItemFactory (testItemBuilder: TestItem.TestItemBuilder) =
                 testItemFactory
                     { testItemBuilder with
-                        testFramework = detectedTestFramework }
+                        testFramework = detectedTestFramework
+                        platformUid = None }
 
             let testHierarchy =
                 testNames
@@ -1533,7 +1552,8 @@ module Interactions =
             let testItemFactory (ti: TestItem.TestItemBuilder) =
                 testItemFactory
                     { ti with
-                        testFramework = testResult.TestFramework }
+                        testFramework = testResult.TestFramework
+                        platformUid = None }
 
             TestItem.getOrMakeHierarchyPath
                 rootTestCollection
@@ -1874,10 +1894,20 @@ module Interactions =
                 let onAttachDebugger (processId: int) =
                     VSCodeActions.launchDebugger (string processId)
 
-                let filterExpression, projectSubset =
+                /// Names the selected tests to Microsoft.Testing.Platform, which runs a test by
+                /// uid rather than by a filter expression. A grouping node holds no uid of its
+                /// own, so a selection is read as the runnable tests under it.
+                let testUids (selectedCases: TestItem seq) =
+                    selectedCases
+                    |> Array.ofSeq
+                    |> TestItem.runnableFromArray
+                    |> Array.choose (fun test -> test.PlatformUid)
+                    |> Array.distinct
+
+                let filterExpression, projectSubset, uids =
                     match req.``include`` with
-                    | None -> None, None
-                    | Some selectedCases when Seq.isEmpty selectedCases -> None, None
+                    | None -> None, None, None
+                    | Some selectedCases when Seq.isEmpty selectedCases -> None, None, None
                     | Some selectedCases ->
                         let filter =
                             selectedCases
@@ -1893,7 +1923,7 @@ module Interactions =
                             |> Array.ofSeq
                             |> Some
 
-                        filter, projectSubset
+                        filter, projectSubset, Some(testUids selectedCases)
 
                 logger.Debug($"Test Filter Expression: {filterExpression}")
 
@@ -1905,6 +1935,7 @@ module Interactions =
                         onAttachDebugger
                         projectSubset
                         filterExpression
+                        uids
                         shouldDebug
 
                 mergeResults TrimMissing.Trim runResult.Data

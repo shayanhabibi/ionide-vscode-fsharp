@@ -95,9 +95,14 @@ module LanguageService =
               ``end``: Fable.Import.VSCode.Vscode.Position }
 
         type TestRunRequest =
-            { LimitToProjects: string array option
-              TestCaseFilter: string option
-              AttachDebugger: bool }
+            {
+                LimitToProjects: string array option
+                TestCaseFilter: string option
+                /// Names the tests to run on Microsoft.Testing.Platform, by the uid each was
+                /// discovered under. `None` runs every test of the projects being run.
+                TestUids: string array option
+                AttachDebugger: bool
+            }
 
     type Uri with
 
@@ -622,6 +627,7 @@ Consider:
         (onAttachDebugger: ProcessId -> JS.Promise<bool>)
         (projectSubset: string array option)
         (testCaseFilter: string option)
+        (testUids: string array option)
         (attachDebugger: bool)
         =
         match client with
@@ -646,6 +652,7 @@ Consider:
             let request: Types.TestRunRequest =
                 { LimitToProjects = projectSubset
                   TestCaseFilter = testCaseFilter
+                  TestUids = testUids
                   AttachDebugger = attachDebugger }
 
             cl.sendRequest ("test/runTests", request)
