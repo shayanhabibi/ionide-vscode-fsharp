@@ -269,26 +269,6 @@ module TestFrameworkId =
         else
             None
 
-module TestItemDTO =
-    let getFullname_withNestedParamTests (dto: TestItemDTO) =
-        match dto.ExecutorUri |> TestFrameworkId.tryFromExecutorUri with
-        // NOTE: XUnit and MSTest don't include the theory case parameters in the FullyQualifiedName, but do include them in the DisplayName.
-        //       Thus we need to append the DisplayName to differentiate the test cases
-        | Some TestFrameworkId.MsTest ->
-            if dto.FullName.EndsWith(dto.DisplayName) then
-                dto.FullName
-            else
-                dto.FullName + "." + dto.DisplayName
-        | Some TestFrameworkId.XUnit ->
-            // NOTE: XUnit includes the FullyQualifiedName in the DisplayName.
-            //       But it doesn't nest theory cases, just appends the case parameters
-            if dto.DisplayName <> dto.FullName then
-                let theoryCaseFragment = dto.DisplayName.Split('.') |> Array.last
-                dto.FullName + "." + theoryCaseFragment
-            else
-                dto.FullName
-        | _ -> dto.FullName
-
 type TestResult =
     { FullTestName: string
       Outcome: TestResultOutcome
@@ -323,7 +303,7 @@ module TestResult =
     let ofTestResultDTO (testResultDto: TestResultDTO) : TestResult =
         let expected, actual = tryExtractExpectedAndActual testResultDto.ErrorMessage
 
-        { FullTestName = testResultDto.TestItem |> TestItemDTO.getFullname_withNestedParamTests
+        { FullTestName = testResultDto.TestItem.FullName
           Outcome = testResultDto.Outcome |> TestResultOutcome.ofOutcomeDto
           Output = testResultDto.AdditionalOutput
           ErrorMessage = testResultDto.ErrorMessage
@@ -974,13 +954,24 @@ module TestItem =
 
             recurse hierarchy
 
-        let mapDtosForProject ((projectPath, targetFramework), flatTests) =
-            let testDtoToNamedItem (dto: TestItemDTO) =
-                {| Data = dto
-                   FullName = dto |> TestItemDTO.getFullname_withNestedParamTests |}
+        /// The tree the server reported, linked through `ParentId`.
+        let hierarchyOfDtos (flatTests: TestItemDTO array) : TestName.NameHierarchy<TestItemDTO> array =
+            let byParent =
+                flatTests |> Array.groupBy (fun dto -> dto.ParentId) |> Map.ofArray
 
-            let namedHierarchies =
-                flatTests |> Array.map testDtoToNamedItem |> TestName.inferHierarchy
+            let childrenOf parentId =
+                byParent |> Map.tryFind parentId |> Option.defaultValue [||]
+
+            let rec build (dto: TestItemDTO) : TestName.NameHierarchy<TestItemDTO> =
+                { TestName.NameHierarchy.Data = (if dto.IsLeaf then Some dto else None)
+                  TestName.NameHierarchy.FullName = dto.FullName
+                  TestName.NameHierarchy.Name = (TestName.splitSegments dto.FullName |> List.last).Text
+                  TestName.NameHierarchy.Children = childrenOf (Some dto.Id) |> Array.map build }
+
+            childrenOf None |> Array.map build
+
+        let mapDtosForProject ((projectPath, targetFramework), flatTests) =
+            let namedHierarchies = hierarchyOfDtos flatTests
 
             let projectChildTestItems =
                 namedHierarchies

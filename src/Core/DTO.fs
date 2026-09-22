@@ -372,6 +372,12 @@ module DTO =
 
     type TestItemDTO =
         {
+            /// Distinguishes this node from every other node reported by the server.
+            Id: string
+            /// The `Id` of the node one level up, or `None` at the root of a project.
+            ParentId: string option
+            /// A runnable test. `false` marks a grouping node.
+            IsLeaf: bool
             FullName: string
             DisplayName: string
             /// Identifies the test adapter that ran the tests
