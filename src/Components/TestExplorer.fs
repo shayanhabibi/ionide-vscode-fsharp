@@ -1273,24 +1273,31 @@ module TestDiscovery =
             (previousCodeTests: TestItem array)
             (newCodeTests: TestItem array)
             =
-            let comparef (t: TestItem) = (t.id, rangeComparable t.range)
-
-            let removed, unchanged, added =
-                ArrayExt.venn comparef comparef previousCodeTests newCodeTests
+            let removed, kept, added =
+                ArrayExt.venn TestItem.getId TestItem.getId previousCodeTests newCodeTests
 
             removed |> Array.map TestItem.getId |> Array.iter targetCollection.delete
 
-            added |> Array.iter targetCollection.add
+            // An item already in the tree is updated in place rather than re-added. `add` replaces the
+            // item with the same id, dropping the `Id` FSAC reported for it and the children FSAC reported under it
+            let updateInPlace (previousCodeChildren: TestItem array) (targetItem: TestItem) (newCodeTest: TestItem) =
+                targetItem.range <- newCodeTest.range
+                recurse targetItem.children previousCodeChildren (newCodeTest.children.TestItems())
 
-            unchanged
+            added
+            |> Array.iter (fun newCodeTest ->
+                match targetCollection.get newCodeTest.id with
+                | None -> targetCollection.add newCodeTest
+                | Some targetItem -> updateInPlace [||] targetItem newCodeTest)
+
+            kept
             |> Array.iter (fun (previousCodeTest, newCodeTest) ->
                 match targetCollection.get newCodeTest.id with
-                | None -> ()
-                | Some targetItem ->
-                    recurse
-                        targetItem.children
-                        (previousCodeTest.children.TestItems())
-                        (newCodeTest.children.TestItems()))
+                | None ->
+                    // a test gone from the tree comes back once its code moves
+                    if rangeComparable previousCodeTest.range <> rangeComparable newCodeTest.range then
+                        targetCollection.add newCodeTest
+                | Some targetItem -> updateInPlace (previousCodeTest.children.TestItems()) targetItem newCodeTest)
 
         recurse targetCollection previousCodeTests newCodeTests
 
