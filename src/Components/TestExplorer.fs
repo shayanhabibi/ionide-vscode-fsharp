@@ -1196,12 +1196,19 @@ module ProjectExt =
 
         Project.getInWorkspace () |> List.map getPath
 
+    /// FSAC sends no IsTestingPlatformApplication, so a Microsoft.Testing.Platform project is
+    /// told by the platform package its runner brings in. Package references here are the
+    /// resolved ones, so the package counts even where only xunit.v3 or MSTest.Sdk is referenced.
     let isTestProject (project: Project) =
         let testProjectIndicators =
-            set [ "Microsoft.TestPlatform.TestHost"; "Microsoft.NET.Test.Sdk" ]
+            set
+                [ "Microsoft.TestPlatform.TestHost"
+                  "Microsoft.NET.Test.Sdk"
+                  "Microsoft.Testing.Platform" ]
 
-        project.PackageReferences
-        |> Array.exists (fun pr -> Set.contains pr.Name testProjectIndicators)
+        project.Info.IsTestProject
+        || project.PackageReferences
+           |> Array.exists (fun pr -> Set.contains pr.Name testProjectIndicators)
 
 
 type CodeBasedTestId = TestId
