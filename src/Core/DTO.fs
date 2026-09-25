@@ -372,7 +372,8 @@ module DTO =
 
     type TestItemDTO =
         {
-            /// Distinguishes this node from every other node reported by the server.
+            /// Distinguishes this node from every other node reported by the server. Opaque: the
+            /// server issues it, and a test is run by sending its `Id` back unchanged.
             Id: string
             /// The `Id` of the node one level up, or `None` at the root of a project.
             ParentId: string option
@@ -384,9 +385,6 @@ module DTO =
             /// Example: executor://xunit/VsTestRunner2/netcoreapp
             /// Used for determining the test library, which effects how tests names are broken down
             ExecutorUri: string
-            /// Addresses a runnable test to Microsoft.Testing.Platform, which identifies tests by
-            /// opaque uid. A grouping node and a test run under VSTest carry `None`.
-            PlatformUid: string option
             ProjectFilePath: string
             TargetFramework: string
             CodeFilePath: string option

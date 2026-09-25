@@ -222,9 +222,10 @@ type TestItem with
 
     member this.TestFramework: string = this?testFramework
 
-    /// Addresses this test to Microsoft.Testing.Platform. A grouping node and a test run under
-    /// VSTest carry `None`.
-    member this.PlatformUid: string option = this?platformUid |> Option.ofObj
+    /// The opaque `Id` FSAC reported for this test, which names it in a run request and in its
+    /// results. `None` for a grouping node, whose id FSAC would not run, and for a test FSAC did
+    /// not report, such as one found only in code.
+    member this.ServerId: string option = this?serverId |> Option.ofObj
 
 [<RequireQualifiedAccess; StringEnum(CaseRules.None)>]
 type TestResultOutcome =
@@ -274,17 +275,21 @@ module TestFrameworkId =
             None
 
 type TestResult =
-    { FullTestName: string
-      Outcome: TestResultOutcome
-      Output: string option
-      ErrorMessage: string option
-      ErrorStackTrace: string option
-      Expected: string option
-      Actual: string option
-      Timing: float
-      TestFramework: TestFrameworkId option
-      ProjectFilePath: ProjectFilePath
-      TargetFramework: TargetFramework }
+    {
+        /// The `Id` of the test FSAC reported this result for. `None` for results read from TRX.
+        ServerId: string option
+        FullTestName: string
+        Outcome: TestResultOutcome
+        Output: string option
+        ErrorMessage: string option
+        ErrorStackTrace: string option
+        Expected: string option
+        Actual: string option
+        Timing: float
+        TestFramework: TestFrameworkId option
+        ProjectFilePath: ProjectFilePath
+        TargetFramework: TargetFramework
+    }
 
 module TestResult =
     let tryExtractExpectedAndActual (message: string option) =
@@ -307,7 +312,8 @@ module TestResult =
     let ofTestResultDTO (testResultDto: TestResultDTO) : TestResult =
         let expected, actual = tryExtractExpectedAndActual testResultDto.ErrorMessage
 
-        { FullTestName = testResultDto.TestItem.FullName
+        { ServerId = Some testResultDto.TestItem.Id
+          FullTestName = testResultDto.TestItem.FullName
           Outcome = testResultDto.Outcome |> TestResultOutcome.ofOutcomeDto
           Output = testResultDto.AdditionalOutput
           ErrorMessage = testResultDto.ErrorMessage
@@ -790,6 +796,31 @@ module TestItem =
         // NOTE: there can be duplicates. i.e. if a child and parent are both selected in the explorer
         |> Array.distinctBy getId
 
+    /// Finds the item among `items` that something reported by FSAC refers to. The `Id` FSAC
+    /// reported decides when there is one; the name-based id is only used for items FSAC did not
+    /// report, or for reports that carry no `Id`.
+    let expectedLookup (items: TestItem array) (keysOf: 'a -> string option * TestId) : 'a -> TestItem option =
+        let byServerId =
+            items
+            |> Array.choose (fun t -> t.ServerId |> Option.map (fun id -> id, t))
+            |> Map.ofArray
+
+        let byName = items |> Array.map (fun t -> t.id, t) |> Map.ofArray
+
+        let byNameWithoutServerId =
+            items
+            |> Array.filter (fun t -> Option.isNone t.ServerId)
+            |> Array.map (fun t -> t.id, t)
+            |> Map.ofArray
+
+        fun reported ->
+            match keysOf reported with
+            | Some serverId, name ->
+                byServerId
+                |> Map.tryFind serverId
+                |> Option.orElseWith (fun () -> byNameWithoutServerId |> Map.tryFind name)
+            | None, name -> byName |> Map.tryFind name
+
     let tryGetLocation (testItem: TestItem) =
         match testItem.uri, testItem.range with
         | Some uri, Some range -> Some(vscode.Location.Create(uri, !^range))
@@ -812,9 +843,8 @@ module TestItem =
             children: TestItem array
             // i.e. NUnit. Used for an Nunit-specific workaround
             testFramework: TestFrameworkId option
-            /// Addresses the test to Microsoft.Testing.Platform, which names a test to run by uid
-            /// rather than by a filter expression.
-            platformUid: string option
+            /// The `Id` FSAC reported for the test, if FSAC reported it and it is not a grouping.
+            serverId: string option
         }
 
     type TestItemFactory = TestItemBuilder -> TestItem
@@ -833,8 +863,8 @@ module TestItem =
             | Some frameworkId -> testItem?testFramework <- frameworkId
             | None -> ()
 
-            match builder.platformUid with
-            | Some uid -> testItem?platformUid <- uid
+            match builder.serverId with
+            | Some id -> testItem?serverId <- id
             | None -> ()
 
             testItem
@@ -859,7 +889,7 @@ module TestItem =
                   range = location |> LocationRecord.tryGetRange
                   children = namedNode.Children |> Array.map recurse
                   testFramework = None
-                  platformUid = None }
+                  serverId = None }
 
         recurse hierarchy
 
@@ -896,7 +926,7 @@ module TestItem =
                       range = range
                       children = t.childs |> Array.map (fun n -> recurse fullName (Some t.moduleType) n)
                       testFramework = t?``type``
-                      platformUid = None }
+                      serverId = None }
 
             ti
 
@@ -915,7 +945,7 @@ module TestItem =
               range = None
               children = children
               testFramework = None
-              platformUid = None }
+              serverId = None }
 
 
     let ofTestDTOs testItemFactory tryGetLocation (flatTests: TestItemDTO array) =
@@ -967,7 +997,7 @@ module TestItem =
                       testFramework =
                         namedNode.Data
                         |> Option.bind (fun t -> t.ExecutorUri |> TestFrameworkId.tryFromExecutorUri)
-                      platformUid = namedNode.Data |> Option.bind (fun dto -> dto.PlatformUid) }
+                      serverId = namedNode.Data |> Option.map (fun dto -> dto.Id) }
 
             recurse hierarchy
 
@@ -1089,7 +1119,7 @@ module TestItem =
                           range = maybeLocation |> LocationRecord.tryGetRange
                           children = [||]
                           testFramework = None
-                          platformUid = None }
+                          serverId = None }
 
             collection.add (testItem)
 
@@ -1165,7 +1195,7 @@ module TestDiscovery =
                       range = withUri.range
                       children = target.children.TestItems()
                       testFramework = withUri?testFramework
-                      platformUid = target.PlatformUid }
+                      serverId = target.ServerId }
 
             (replacementItem, withUri)
 
@@ -1318,7 +1348,7 @@ module TestDiscovery =
                 testItemFactory
                     { testItemBuilder with
                         testFramework = detectedTestFramework
-                        platformUid = None }
+                        serverId = None }
 
             let testHierarchy =
                 testNames
@@ -1553,7 +1583,7 @@ module Interactions =
                 testItemFactory
                     { ti with
                         testFramework = testResult.TestFramework
-                        platformUid = None }
+                        serverId = None }
 
             TestItem.getOrMakeHierarchyPath
                 rootTestCollection
@@ -1563,13 +1593,23 @@ module Interactions =
                 testResult.TargetFramework
                 testResult.FullTestName
 
-        let treeItemComparable (t: TestItem) = TestItem.getId t
+        let tryFindExpected =
+            TestItem.expectedLookup expectedToRun (fun (r: TestResult) ->
+                r.ServerId, TestItem.constructId r.ProjectFilePath r.FullTestName)
 
-        let resultComparable (r: TestResult) =
-            TestItem.constructId r.ProjectFilePath r.FullTestName
+        let matched, added =
+            testResults
+            |> Array.map (fun r -> tryFindExpected r, r)
+            |> Array.partition (fst >> Option.isSome)
 
-        let missing, expected, added =
-            ArrayExt.venn treeItemComparable resultComparable expectedToRun testResults
+        let expected = matched |> Array.map (fun (t, r) -> t.Value, r)
+        let added = added |> Array.map snd
+
+        let matchedIds = expected |> Array.map (fst >> TestItem.getId) |> Set.ofArray
+
+        let missing =
+            expectedToRun
+            |> Array.filter (fun t -> not (matchedIds.Contains(TestItem.getId t)))
 
         expected |> Array.iter (displayTestResultInExplorer testRun)
 
@@ -1591,7 +1631,8 @@ module Interactions =
         let expected, actual =
             TestResult.tryExtractExpectedAndActual trxResult.UnitTestResult.Output.ErrorInfo.Message
 
-        { FullTestName = trxResult.UnitTest.FullName
+        { ServerId = None
+          FullTestName = trxResult.UnitTest.FullName
           Outcome = !!trxResult.UnitTestResult.Outcome
           Output = trxResult.UnitTestResult.Output.StdOut
           ErrorMessage = trxResult.UnitTestResult.Output.ErrorInfo.Message
@@ -1818,21 +1859,70 @@ module Interactions =
                     |> ignore
             }
 
+    /// The tests a selection names to FSAC, by the `Id` FSAC reported for each. A grouping node
+    /// is read as the runnable tests under it. A test FSAC did not report, such as one found only
+    /// in code, has no `Id`: discovery is run once to find it, and a test still without one is
+    /// marked errored rather than widening the run.
+    let private resolveSelectedTestIds
+        (rediscover: unit -> JS.Promise<unit>)
+        (rootTestCollection: TestItemCollection)
+        (testRun: TestRun)
+        (selectedCases: TestItem array)
+        =
+        promise {
+            let selectedTests = selectedCases |> TestItem.runnableFromArray
+
+            let! selectedTests =
+                if selectedTests |> Array.forall (fun t -> Option.isSome t.ServerId) then
+                    Promise.lift selectedTests
+                else
+                    promise {
+                        do! rediscover ()
+                        let discovered = rootTestCollection.TestItems()
+
+                        // Discovery replaces the items in the tree, so every selected test is looked up again.
+                        return
+                            selectedTests
+                            |> Array.map (fun t -> TestItem.tryGetById t.id discovered |> Option.defaultValue t)
+                    }
+
+            let unresolved = selectedTests |> Array.filter (fun t -> Option.isNone t.ServerId)
+
+            unresolved
+            |> TestRun.showError
+                testRun
+                "This test was not found by test discovery, so it cannot be run. Try refreshing the test explorer"
+
+            let runnable = selectedTests |> Array.filter (fun t -> Option.isSome t.ServerId)
+            let testIds = runnable |> Array.choose (fun t -> t.ServerId) |> Array.distinct
+
+            return runnable, testIds
+        }
+
     let private runTests_WithLanguageServer
         mergeTestResultsToExplorer
+        (rediscover: unit -> JS.Promise<unit>)
         (rootTestCollection: TestItemCollection)
         (req: TestRunRequest)
         testRun
         =
         promise {
             try
-                let expectedToRun =
-                    req.``include``
-                    |> Option.map Array.ofSeq
-                    |> Option.defaultValue (rootTestCollection.TestItems())
-                    |> Array.collect TestItem.runnableChildren
+                let! expectedToRun, testIds =
+                    match req.``include`` |> Option.map Array.ofSeq with
+                    | Some selectedCases when not (Array.isEmpty selectedCases) ->
+                        promise {
+                            let! runnable, testIds =
+                                resolveSelectedTestIds rediscover rootTestCollection testRun selectedCases
 
-                let expectedTestsById = expectedToRun |> Array.map (fun t -> t.id, t) |> Map
+                            return runnable, Some testIds
+                        }
+                    | _ ->
+                        Promise.lift (rootTestCollection.TestItems() |> Array.collect TestItem.runnableChildren, None)
+
+                let tryFindExpected =
+                    TestItem.expectedLookup expectedToRun (fun (t: TestItemDTO) ->
+                        Some t.Id, TestItem.constructId t.ProjectFilePath t.FullName)
 
                 let mergeResults (shouldTrim: TrimMissing) (resultDtos: TestResultDTO array) =
                     let actuallyRan: TestResult array =
@@ -1842,15 +1932,7 @@ module Interactions =
 
                 let showStarted (testItems: TestItemDTO array) =
                     try
-                        let groups = testItems |> Array.groupBy (fun t -> t.ProjectFilePath)
-
-                        groups
-                        |> Array.iter (fun (projPath, activeTests) ->
-                            let testIdsToStart =
-                                activeTests |> Array.map (fun t -> TestItem.constructId projPath t.FullName)
-
-                            let knownExplorerItems = testIdsToStart |> Array.choose expectedTestsById.TryFind
-                            knownExplorerItems |> TestRun.showStarted testRun)
+                        testItems |> Array.choose tryFindExpected |> TestRun.showStarted testRun
                     with ex ->
                         logger.Debug("Threw error while mapping active test items to the explorer", ex)
 
@@ -1894,58 +1976,26 @@ module Interactions =
                 let onAttachDebugger (processId: int) =
                     VSCodeActions.launchDebugger (string processId)
 
-                /// Names the selected tests to Microsoft.Testing.Platform, which runs a test by
-                /// uid rather than by a filter expression. A grouping node holds no uid of its
-                /// own, so a selection is read as the runnable tests under it.
-                let testUids (selectedCases: TestItem seq) =
-                    selectedCases
-                    |> Array.ofSeq
-                    |> TestItem.runnableFromArray
-                    |> Array.choose (fun test -> test.PlatformUid)
-                    |> Array.distinct
-
-                let filterExpression, projectSubset, uids =
-                    match req.``include`` with
-                    | None -> None, None, None
-                    | Some selectedCases when Seq.isEmpty selectedCases -> None, None, None
-                    | Some selectedCases ->
-                        let filter =
-                            selectedCases
-                            |> Array.ofSeq
-                            |> Array.filter (fun t -> t.id |> TestItem.getFullName <> String.Empty)
-                            |> buildFilterExpression
-                            |> Some
-
-                        let projectSubset =
-                            selectedCases
-                            |> Seq.map (TestItem.getId >> TestItem.getProjectPath)
-                            |> Seq.distinct
-                            |> Array.ofSeq
-                            |> Some
-
-                        filter, projectSubset, Some(testUids selectedCases)
-
-                logger.Debug($"Test Filter Expression: {filterExpression}")
-
                 let shouldDebug = TestRunRequest.isDebugRequested req
 
-                let! runResult =
-                    LanguageService.runTests
-                        onTestRunProgress
-                        onAttachDebugger
-                        projectSubset
-                        filterExpression
-                        uids
-                        shouldDebug
+                match testIds with
+                | Some ids when Array.isEmpty ids -> ()
+                | _ ->
+                    logger.Debug($"Test ids: {testIds}")
 
-                mergeResults TrimMissing.Trim runResult.Data
+                    // A selection is named by id alone: FSAC rejects ids sent with a filter, and
+                    // works out the projects to run from the ids.
+                    let! runResult =
+                        LanguageService.runTests onTestRunProgress onAttachDebugger None None testIds shouldDebug
 
-                if Array.isEmpty runResult.Data then
-                    let message =
-                        $"WARNING: No tests ran. The test explorer might be out of sync. Try running a higher test group or refreshing the test explorer"
+                    mergeResults TrimMissing.Trim runResult.Data
 
-                    window.showWarningMessage (message) |> ignore
-                    TestRun.Output.appendWarningLine testRun message
+                    if Array.isEmpty runResult.Data then
+                        let message =
+                            $"WARNING: No tests ran. The test explorer might be out of sync. Try running a higher test group or refreshing the test explorer"
+
+                        window.showWarningMessage (message) |> ignore
+                        TestRun.Output.appendWarningLine testRun message
             with ex ->
                 logger.Debug("Test run failed with exception", ex)
                 TestRun.Output.appendErrorLine testRun $"The test run errored {Environment.NewLine}{string ex}"
@@ -2019,7 +2069,17 @@ module Interactions =
 
                     testRun.``end`` ()
                 else
-                    do! runTests_WithLanguageServer mergeTestResultsToExplorer testController.items req testRun
+                    let rediscover () =
+                        discoverTests_WithLanguageServer testItemFactory testController.items tryGetLocation
+
+                    do!
+                        runTests_WithLanguageServer
+                            mergeTestResultsToExplorer
+                            rediscover
+                            testController.items
+                            req
+                            testRun
+
                     testRun.``end`` ()
                     do! discoverTests_WithLanguageServer testItemFactory testController.items tryGetLocation
 
