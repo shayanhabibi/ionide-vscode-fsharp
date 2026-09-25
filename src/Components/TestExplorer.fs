@@ -769,6 +769,10 @@ module TestItem =
 
     let getId (t: TestItem) = t.id
 
+    /// Tells apart the tests a run selects. The `Id` FSAC reported is unique where the name-based
+    /// id is not, such as for tests of one display name under different parents.
+    let getRunKey (t: TestItem) = t.ServerId |> Option.defaultValue t.id
+
     let tryPick (f: TestItem -> Option<'u>) root =
         let rec recurse testItem =
             let searchResult = f testItem
@@ -786,7 +790,13 @@ module TestItem =
             if testItem.children.size = 0. then
                 [| testItem |]
             else
-                testItem.children.TestItems() |> Array.collect visit
+                let runnableBelow = testItem.children.TestItems() |> Array.collect visit
+
+                // A test FSAC reported can hold tests of its own, and runs alongside them.
+                if Option.isSome testItem.ServerId then
+                    Array.append [| testItem |] runnableBelow
+                else
+                    runnableBelow
 
         visit root
 
@@ -794,7 +804,7 @@ module TestItem =
         testCollection
         |> Array.collect runnableChildren
         // NOTE: there can be duplicates. i.e. if a child and parent are both selected in the explorer
-        |> Array.distinctBy getId
+        |> Array.distinctBy getRunKey
 
     /// Finds the item among `items` that something reported by FSAC refers to. The `Id` FSAC
     /// reported decides when there is one; the name-based id is only used for items FSAC did not
@@ -1001,20 +1011,41 @@ module TestItem =
 
             recurse hierarchy
 
-        /// The tree the server reported, linked through `ParentId`.
+        /// The tree the server reported, linked through `ParentId`. An explorer item is named by
+        /// its full name, which FSAC does not keep unique among siblings: a grouping can share its
+        /// name with a test, and tests can share a display name. A grouping is shown as one node
+        /// with the test of its name, and each further test of a name gets a numbered name, so that
+        /// no sibling replaces another in the tree.
         let hierarchyOfDtos (flatTests: TestItemDTO array) : TestName.NameHierarchy<TestItemDTO> array =
             let byParent = flatTests |> Array.groupBy (fun dto -> dto.ParentId) |> Map.ofArray
 
             let childrenOf parentId =
                 byParent |> Map.tryFind parentId |> Option.defaultValue [||]
 
-            let rec build (dto: TestItemDTO) : TestName.NameHierarchy<TestItemDTO> =
-                { TestName.NameHierarchy.Data = (if dto.IsLeaf then Some dto else None)
-                  TestName.NameHierarchy.FullName = dto.FullName
-                  TestName.NameHierarchy.Name = (TestName.splitSegments dto.FullName |> List.last).Text
-                  TestName.NameHierarchy.Children = childrenOf (Some dto.Id) |> Array.map build }
+            let rec build (siblings: TestItemDTO array) : TestName.NameHierarchy<TestItemDTO> array =
+                siblings
+                |> Array.groupBy (fun dto -> dto.FullName)
+                |> Array.collect (fun (fullName, named) ->
+                    let node data explorerName (holders: TestItemDTO array) =
+                        { TestName.NameHierarchy.Data = data
+                          TestName.NameHierarchy.FullName = explorerName
+                          TestName.NameHierarchy.Name = (TestName.splitSegments fullName |> List.last).Text
+                          TestName.NameHierarchy.Children =
+                            holders |> Array.collect (fun dto -> childrenOf (Some dto.Id)) |> build }
 
-            childrenOf None |> Array.map build
+                    let tests, groupings = named |> Array.partition (fun dto -> dto.IsLeaf)
+
+                    if Array.isEmpty tests then
+                        [| node None fullName groupings |]
+                    else
+                        tests
+                        |> Array.mapi (fun index test ->
+                            if index = 0 then
+                                node (Some test) fullName (Array.append [| test |] groupings)
+                            else
+                                node (Some test) $"{fullName} #{index + 1}" [| test |]))
+
+            childrenOf None |> build
 
         let mapDtosForProject ((projectPath, targetFramework), flatTests) =
             let namedHierarchies = hierarchyOfDtos flatTests
@@ -1605,11 +1636,11 @@ module Interactions =
         let expected = matched |> Array.map (fun (t, r) -> t.Value, r)
         let added = added |> Array.map snd
 
-        let matchedIds = expected |> Array.map (fst >> TestItem.getId) |> Set.ofArray
+        let matchedIds = expected |> Array.map (fst >> TestItem.getRunKey) |> Set.ofArray
 
         let missing =
             expectedToRun
-            |> Array.filter (fun t -> not (matchedIds.Contains(TestItem.getId t)))
+            |> Array.filter (fun t -> not (matchedIds.Contains(TestItem.getRunKey t)))
 
         expected |> Array.iter (displayTestResultInExplorer testRun)
 
